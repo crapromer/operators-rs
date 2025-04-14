@@ -154,10 +154,10 @@ impl crate::Operator for Operator {
             };
         }
 
-        let gemm_f32_q8 = move || {
+        let gemm_f32_q8 = move || unsafe {
             (0..batch as isize).for_each(|i| unsafe {
                 let a_ptr = (a as *const Q8_0).offset(i * a_stride);
-                let b_ptr = b as *const f32;
+                let b_ptr = (b as *const f32).offset(i * b_stride);
                 let b_vec = quantize_f32_q8_0(b_ptr, b_ld as usize, k, n);
                 let c_ptr = (c as *mut f32).offset(i * c_stride);
                 for am in 0..m {
