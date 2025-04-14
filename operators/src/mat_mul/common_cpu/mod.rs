@@ -160,9 +160,9 @@ impl crate::Operator for Operator {
                 let b_ptr = (b as *const f32).offset(i * b_stride);
                 let b_vec = quantize_f32_q8_0(b_ptr, b_ld as usize, k, n);
                 let c_ptr = (c as *mut f32).offset(i * c_stride);
-                let mut sum = 0.0f32;
                 for am in 0..m {
                     for bn in 0..n {
+                        let mut sum = 0.0f32;
                         for block in 0..(k / 32) {
                             let a_block = &*a_ptr.add(block + am * a_ld as usize / 32);
                             let b_block = &b_vec[block + bn * k / 32 as usize];
