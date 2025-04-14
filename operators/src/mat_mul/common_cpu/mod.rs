@@ -1,6 +1,8 @@
 ﻿use super::{args::SchemeLayout, Args, MatMul};
 use crate::{common_cpu::Cpu, type_not_support, ByteOf, LaunchError, QueueAlloc, SchemeError};
 
+use ggml_quants::Q8_0;
+use half::f16;
 pub struct Operator;
 
 impl MatMul<Cpu> for Operator {}
@@ -33,7 +35,8 @@ impl crate::Operator for Operator {
         QA: QueueAlloc<Hardware = Self::Hardware>,
     {
         let SchemeLayout {
-            dt,
+            dt_a,
+            dt_b,
             ab_swap,
             a_trans,
             b_trans,
@@ -97,11 +100,12 @@ impl crate::Operator for Operator {
 
         use digit_layout::types as ty;
         use gemm::f16;
-        match dt {
-            ty::F16 => gemm!(f16; f16::from_f32(alpha), f16::from_f32(beta)),
-            ty::F32 => gemm!(f32; alpha, beta),
-            ty::F64 => gemm!(f64; alpha as _, beta as _),
-            _ => Err(type_not_support(format!("Unsupported {dt}")))?,
+        use ggml_quants::types as qty;
+        match (dt_a, dt_b) {
+            (ty::F16, ty::F16) => gemm!(f16; f16::from_f32(alpha), f16::from_f32(beta)),
+            (ty::F32, ty::F32) => gemm!(f32; alpha, beta),
+            (ty::F64, ty::F64) => gemm!(f64; alpha as _, beta as _),
+            _ => Err(type_not_support(format!("Unsupported {dt_a},{dt_b}")))?,
         }
         Ok(())
     }

@@ -21,7 +21,9 @@ pub struct Args<H: Hardware> {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(super) struct SchemeLayout {
-    pub dt: DigitLayout,
+    // pub dt: DigitLayout,
+    pub dt_a: DigitLayout,
+    pub dt_b: DigitLayout,
     pub ab_swap: bool,
     pub a_trans: bool,
     pub b_trans: bool,
@@ -99,7 +101,9 @@ impl<H: Hardware> Args<H> {
         let (a_ld, a_trans) = a.ld_trans()?;
         let (b_ld, b_trans) = b.ld_trans()?;
         Ok(SchemeLayout {
-            dt: type_distinct(&[c_layout.dt(), a_layout.dt(), b_layout.dt()])?,
+            // dt: type_distinct(&[c_layout.dt(), a_layout.dt(), b_layout.dt()])?,
+            dt_a: a_layout.dt(),
+            dt_b: b_layout.dt(),
             ab_swap,
             a_trans,
             b_trans,

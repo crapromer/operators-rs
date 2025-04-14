@@ -46,7 +46,8 @@ impl crate::Operator for Operator {
         QA: QueueAlloc<Hardware = Self::Hardware>,
     {
         let SchemeLayout {
-            dt,
+            dt_a,
+            dt_b,
             ab_swap,
             a_trans,
             b_trans,
@@ -70,9 +71,9 @@ impl crate::Operator for Operator {
             ..
         } = args;
 
-        if dt != F16 {
-            return Err(type_not_support("").into());
-        }
+        // if dt != F16 {
+        //     return Err(type_not_support("").into());
+        // }
 
         let (a, b) = if ab_swap {
             (b_base, a_base)
