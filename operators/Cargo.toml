@@ -21,7 +21,7 @@ num-traits = "0.2"
 itertools = "0.14"
 half = "2.4"
 log = "0.4"
-ggml-quants = {git = "https://github.com/crapromer/gguf.git" , rev = "f41d0da"}
+ggml-quants = {git = "https://github.com/crapromer/gguf.git" , rev = "495fe62"}
 
 gemm = { version = "0.18", optional = true }
 
