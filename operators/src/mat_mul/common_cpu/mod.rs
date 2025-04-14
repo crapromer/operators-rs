@@ -10,10 +10,10 @@ pub struct Operator;
 pub fn quantize_f32_q8_0(data: *const f32, ld: usize, rows: usize, columns: usize) -> Vec<Q8_0> {
     //TODO:实现对任意维度的量化
     use std::simd::f32x4;
-    let totol_len = rows * columns;
-    assert!(totol_len % 32 == 0);
+    let total_len = rows * columns;
+    assert!(total_len % 32 == 0);
 
-    let mut bs = Vec::with_capacity(totol_len / 32);
+    let mut bs = Vec::with_capacity(total_len / 32);
     (0..columns as isize).for_each(|c| unsafe {
         let ptr = data.offset(c * ld as isize);
         let ptr_ref = slice::from_raw_parts(ptr, rows);
@@ -154,7 +154,7 @@ impl crate::Operator for Operator {
             };
         }
 
-        let gemm_f32_q8 = move || unsafe {
+        let gemm_f32_q8 = move || {
             (0..batch as isize).for_each(|i| unsafe {
                 let a_ptr = (a as *const Q8_0).offset(i * a_stride);
                 let b_ptr = (b as *const f32).offset(i * b_stride);
