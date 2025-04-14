@@ -1,5 +1,5 @@
 // #![deny(warnings)]
-
+#![feature(portable_simd)]
 mod common;
 mod handle;
 
