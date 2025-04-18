@@ -151,11 +151,12 @@ fn gemm_q8_q8(
                                     let elem_idx = work_idx * work_len + chunk_idx * chunk_len + i;
                                     let am = elem_idx % m;
                                     let bn: usize = (elem_idx - am) / m;
-                                    *cval = vec_dot_q8_0_q8_0_avx2(
+                                    let sum = vec_dot_q8_0_q8_0_avx2(
                                         &a_ref[am * a_ld / 32 as usize
                                             ..am * a_ld / 32 as usize + k / 32],
                                         &b_ref[bn * k / 32 as usize..bn * k / 32 as usize + k / 32],
                                     );
+                                    *cval = alpha * sum + beta * *cval;
                                 }
                             },
                         );
