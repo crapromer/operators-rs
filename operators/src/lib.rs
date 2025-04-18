@@ -1,5 +1,6 @@
 // #![deny(warnings)]
 #![feature(portable_simd)]
+#![feature(iter_array_chunks)]
 mod common;
 mod handle;
 

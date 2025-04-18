@@ -14,7 +14,7 @@ iluvatar-gpu = ["cuda", "cublas", "fslock", "libloading"]
 
 [dependencies]
 digit-layout = "0.3"
-ndarray-layout = "0.1"
+ndarray-layout = "0.2.1"
 rayon = "1.10"
 lru = "0.12"
 num-traits = "0.2"
@@ -36,6 +36,7 @@ cublas = { workspace = true, optional = true }
 nccl = { workspace = true, optional = true }
 fslock = { version = "0.2", optional = true }
 libloading = { version = "0.8", optional = true }
+crossbeam = "0.8.4"
 
 [build-dependencies]
 build-script-cfg = "0.0"

@@ -1,6 +1,8 @@
 ﻿use super::{args::SchemeLayout, Args, MatMul};
-use crate::{common_cpu::Cpu, type_not_support, ByteOf, LaunchError, QueueAlloc, SchemeError, Workspace};
-
+use crate::{
+    common_cpu::Cpu, type_not_support, ByteOf, LaunchError, QueueAlloc, SchemeError, Workspace,
+};
+mod archutil;
 use core::slice;
 use ggml_quants::Q8_0;
 use half::f16;
@@ -10,16 +12,62 @@ use std::mem;
 use std::simd::num::SimdFloat;
 pub struct Operator;
 
-pub fn quantize_f32_q8_0(data: *const f32, dst: *mut Q8_0 ,ld: usize, rows: usize, columns: usize) {
+pub fn vec_dot_q8_0_q8_0_avx2(abs: &[Q8_0], bbs: &[Q8_0]) -> f32 {
+    use std::arch::x86_64::*;
+
+    use archutil::x86_64::*;
+
+    debug_assert_eq!(abs.len(), bbs.len());
+
+    unsafe {
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
+
+        for [(abs0, bbs0), (abs1, bbs1)] in abs.iter().zip(bbs).array_chunks::<2>() {
+            let d0 = _mm256_set1_ps(abs0.delta.to_f32() * bbs0.delta.to_f32());
+            let d1 = _mm256_set1_ps(abs1.delta.to_f32() * bbs1.delta.to_f32());
+
+            let qa0 = _mm256_loadu_si256(abs0.quants.as_ptr() as *const __m256i);
+            let qb0 = _mm256_loadu_si256(bbs0.quants.as_ptr() as *const __m256i);
+
+            let qa1 = _mm256_loadu_si256(abs1.quants.as_ptr() as *const __m256i);
+            let qb1 = _mm256_loadu_si256(bbs1.quants.as_ptr() as *const __m256i);
+
+            let q0 = mul_sum_i8_pairs_float(qa0, qb0);
+            let q1 = mul_sum_i8_pairs_float(qa1, qb1);
+
+            acc0 = _mm256_fmadd_ps(d0, q0, acc0);
+            acc1 = _mm256_fmadd_ps(d1, q1, acc1);
+        }
+
+        if abs.len() % 2 == 1 {
+            let a = abs.last().unwrap_unchecked();
+            let b = bbs.last().unwrap_unchecked();
+
+            let d = _mm256_set1_ps(a.delta.to_f32() * b.delta.to_f32());
+
+            let qa = _mm256_loadu_si256(a.quants.as_ptr() as *const __m256i);
+            let qb = _mm256_loadu_si256(b.quants.as_ptr() as *const __m256i);
+
+            let q = mul_sum_i8_pairs_float(qa, qb);
+
+            acc0 = _mm256_fmadd_ps(d, q, acc0);
+        }
+
+        hsum_float_8(_mm256_add_ps(acc0, acc1))
+    }
+}
+
+pub fn quantize_f32_q8_0(data: *const f32, ld: usize, rows: usize, columns: usize) -> Vec<Q8_0> {
     //TODO:实现对任意维度的量化
     use std::simd::f32x4;
     let total_len = rows * columns;
     assert!(total_len % 32 == 0);
 
-    let mut output_index = 0;
+    let mut bs = Vec::with_capacity(total_len / 32);
     (0..columns as isize).for_each(|c| unsafe {
         let ptr = data.offset(c * ld as isize);
-        let ptr_ref = std::slice::from_raw_parts(ptr, rows);
+        let ptr_ref = slice::from_raw_parts(ptr, rows);
         for i in (0..rows).step_by(32) {
             let mut vsrc = [f32x4::splat(0.0); 8];
             let mut vasrc = [f32x4::splat(0.0); 8];
@@ -54,28 +102,20 @@ pub fn quantize_f32_q8_0(data: *const f32, dst: *mut Q8_0 ,ld: usize, rows: usiz
                 qs[4 * j + 3] = vi[3] as i8;
             }
 
-            // Write directly to the output pointer
-            *dst.add(output_index) = Q8_0 {
+            bs.push(Q8_0 {
                 delta: f16::from_f32(d),
                 quants: qs,
-            };
-            output_index += 1;
+            });
         }
     });
-}
 
-unsafe fn hsum256_ps(v: __m256) -> f32 {
-    let v128 = _mm_add_ps(_mm256_extractf128_ps(v, 1), _mm256_castps256_ps128(v));
-    let v64 = _mm_add_ps(v128, _mm_movehl_ps(v128, v128));
-    let v32 = _mm_add_ss(v64, _mm_movehdup_ps(v64));
-    _mm_cvtss_f32(v32)
+    bs
 }
 
 fn gemm_q8_q8(
     a: *const Q8_0,
     b: *const Q8_0,
     c: *mut f32,
-    workspace: *mut Q8_0,
     batch: usize,
     m: usize,
     n: usize,
@@ -87,48 +127,61 @@ fn gemm_q8_q8(
     b_stride: isize,
     c_stride: isize,
     alpha: f32,
-    beta:f32
+    beta: f32,
 ) {
     (0..batch as isize).for_each(|i| unsafe {
         let a_ptr = a.offset(i * a_stride);
         let b_ptr = b.offset(i * b_stride);
-        quantize_f32_q8_0(b as *const f32,workspace, b_ld as usize, k, n);
+        let b_vec = quantize_f32_q8_0(b_ptr as *const f32, b_ld as usize, k, n);
         let c_ptr = c.offset(i * c_stride);
-        for am in 0..m {
-            for bn in 0..n {
-                let mut sum = _mm256_setzero_ps();
-                for block in 0..(k / 32) {
-                    let a_block = &*a_ptr.add(block + am * a_ld as usize / 32);
-                    let b_block = &*b_ptr.add(block + bn * k / 32 as usize);
-                    let a_i8 = _mm256_loadu_si256(a_block.quants.as_ptr() as *const __m256i);
-                    let a_i16_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a_i8, 0));
-                    let a_i16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a_i8, 1));
-                    let b_i8 = _mm256_loadu_si256(b_block.quants.as_ptr() as *const __m256i);
-                    let b_i16_lo = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b_i8, 0));
-                    let b_i16_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(b_i8, 1));
-                    let prod_lo = _mm256_madd_epi16(a_i16_lo, b_i16_lo);
-                    let prod_hi = _mm256_madd_epi16(a_i16_hi, b_i16_hi);
-                    let prod_lo_f = _mm256_cvtepi32_ps(prod_lo);
-                    let prod_hi_f = _mm256_cvtepi32_ps(prod_hi);
-                    let delta = a_block.delta.to_f32() * b_block.delta.to_f32();
-                    let delta_vec = _mm256_set1_ps(delta);
+        let a_ref = slice::from_raw_parts(a_ptr, m * k / 32);
+        let b_ref = b_vec.as_slice();
+        let c_ref = slice::from_raw_parts_mut(c_ptr, m * n);
+        let work_len = c_ref.len() / 16;
+        let chunk_len = 16;
+        let _ = crossbeam::scope(|s| {
+            c_ref
+                .chunks_mut(work_len)
+                .enumerate()
+                .for_each(|(work_idx, work_buf)| {
+                    s.spawn(move |_| {
+                        work_buf.chunks_mut(chunk_len).enumerate().for_each(
+                            |(chunk_idx, chunk_buf)| {
+                                for (i, cval) in chunk_buf.iter_mut().enumerate() {
+                                    let elem_idx = work_idx * work_len + chunk_idx * chunk_len + i;
+                                    let am = elem_idx % m;
+                                    let bn: usize = (elem_idx - am) / m;
+                                    *cval = vec_dot_q8_0_q8_0_avx2(
+                                        &a_ref[am * a_ld / 32 as usize
+                                            ..am * a_ld / 32 as usize + k / 32],
+                                        &b_ref[bn * k / 32 as usize..bn * k / 32 as usize + k / 32],
+                                    );
+                                }
+                            },
+                        );
+                    });
+                });
+        });
+        // for am in 0..m {
+        //     for bn in 0..n {
+        //         let mut sum = 0.0f32;
+        //         // for block in 0..(k / 32) {
+        //         //     // let a_block = &*a_ptr.add(block + am * a_ld as usize / 32);
+        //         //     // let b_block = &b_vec[block + bn * k / 32 as usize];
 
-                    let res_lo = _mm256_mul_ps(prod_lo_f, delta_vec);
-                    let res_hi = _mm256_mul_ps(prod_hi_f, delta_vec);
-
-                    // 累加到结果
-                    sum = _mm256_add_ps(sum, res_lo);
-                    sum = _mm256_add_ps(sum, res_hi);
-                }
-                let sum = hsum256_ps(sum);
-                let temp_c_ptr = c_ptr.add(bn * c_ld as usize + am);
-                *temp_c_ptr = alpha * sum + beta * *temp_c_ptr;
-            }
-        }
+        //         // }
+        //         sum = vec_dot_q8_0_q8_0_avx2(
+        //             &a_ref[am * a_ld / 32 as usize..am * a_ld / 32 as usize + k / 32],
+        //             &b_ref[bn * k / 32 as usize..bn * k / 32 as usize + k / 32],
+        //         );
+        //         let temp_c_ptr = c_ptr.add(bn * c_ld as usize + am);
+        //         *temp_c_ptr = alpha * sum + beta * *temp_c_ptr;
+        //     }
+        // }
     });
 }
 
-fn kongzhuan(){}
+fn kongzhuan() {}
 
 impl MatMul<Cpu> for Operator {}
 
@@ -153,8 +206,8 @@ impl crate::Operator for Operator {
     fn launch<QA>(
         &self,
         args: &Self::Args,
-        workspace: &mut [ByteOf<Self::Hardware>],
-        queue_alloc: &QA,
+        _workspace: &mut [ByteOf<Self::Hardware>],
+        _queue_alloc: &QA,
     ) -> Result<(), LaunchError>
     where
         QA: QueueAlloc<Hardware = Self::Hardware>,
@@ -222,8 +275,8 @@ impl crate::Operator for Operator {
                 })
             };
         }
-        let workspace_size = n * k /32 * 34;
-        let mut workspace = Workspace::new(queue_alloc, workspace, workspace_size as _);
+        // let workspace_size = n * k / 32 * 34;
+        // let mut workspace = Workspace::new(queue_alloc, workspace, workspace_size as _);
 
         use digit_layout::types as ty;
         use gemm::f16;
@@ -236,7 +289,6 @@ impl crate::Operator for Operator {
                 a as *const Q8_0,
                 b as *const Q8_0,
                 c as *mut f32,
-                workspace.as_mut_ptr() as *mut Q8_0,
                 batch,
                 m,
                 n,
