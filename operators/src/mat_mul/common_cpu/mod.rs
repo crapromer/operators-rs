@@ -58,6 +58,51 @@ pub fn vec_dot_q8_0_q8_0_avx2(abs: &[Q8_0], bbs: &[Q8_0]) -> f32 {
     }
 }
 
+pub fn vec_dot_f32_f32(a: &[f32], a_offset: usize, b: &[f32], b_offset: usize, len: usize) -> f32 {
+    let ac = &a[a_offset..a_offset + len];
+    let bc = &b[b_offset..b_offset + len];
+    let mut sum = 0.0;
+    for i in 0..len {
+        sum += ac[i] * bc[i];
+    }
+    sum
+}
+
+fn vec_dot_f32_f32_simd(
+    a: &[f32],
+    b: &[f32],
+    k: usize
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    unsafe {
+
+        let mut sumv = _mm256_setzero_ps();
+        let k_rounded_down = k - k % 8; // Round down to the nearest multiple of 8
+
+        for ki in (0..k_rounded_down).step_by(8) {
+            let av = _mm256_loadu_ps(a.as_ptr().add(ki));
+            let bv = _mm256_loadu_ps(b.as_ptr().add(ki));
+            // Fused multiply-add operation: sumv += av * bv
+            sumv = _mm256_fmadd_ps(av, bv, sumv);
+        }
+
+        // Horizontal sum of the vector elements
+        let mut sum_arr = [0.0_f32; 8];
+        _mm256_storeu_ps(sum_arr.as_mut_ptr(), sumv);
+        let partial_sum = sum_arr.iter().sum::<f32>();
+
+        // Scalar computation for the remaining elements
+        let mut scalar_sum = 0.0;
+        for ki in k_rounded_down..k {
+            scalar_sum += a[ki] * b[ki];
+        }
+
+        partial_sum + scalar_sum
+    }
+}
+
+
 pub fn quantize_f32_q8_0(data: *const f32, ld: usize, rows: usize, columns: usize) -> Vec<Q8_0> {
     //TODO:实现对任意维度的量化
     use std::simd::f32x4;
@@ -163,22 +208,43 @@ fn gemm_q8_q8(
                     });
                 });
         });
-        // for am in 0..m {
-        //     for bn in 0..n {
-        //         let mut sum = 0.0f32;
-        //         // for block in 0..(k / 32) {
-        //         //     // let a_block = &*a_ptr.add(block + am * a_ld as usize / 32);
-        //         //     // let b_block = &b_vec[block + bn * k / 32 as usize];
+    });
+}
 
-        //         // }
-        //         sum = vec_dot_q8_0_q8_0_avx2(
-        //             &a_ref[am * a_ld / 32 as usize..am * a_ld / 32 as usize + k / 32],
-        //             &b_ref[bn * k / 32 as usize..bn * k / 32 as usize + k / 32],
-        //         );
-        //         let temp_c_ptr = c_ptr.add(bn * c_ld as usize + am);
-        //         *temp_c_ptr = alpha * sum + beta * *temp_c_ptr;
-        //     }
-        // }
+fn gemm_f32_f32(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    a_ld: usize,
+    b_ld: usize,
+    c_ld: usize,
+    a_stride: isize,
+    b_stride: isize,
+    c_stride: isize,
+    alpha: f32,
+    beta: f32,
+) {
+
+    (0..batch as isize).for_each(|i| unsafe {
+        let a_ptr = a.offset(i * a_stride) as usize;
+        let b_ptr = b.offset(i * b_stride) as usize;
+        let c_ptr = c.offset(i * c_stride) as usize;
+        (0..m).into_par_iter().for_each(|am| {
+            (0..n).into_par_iter().for_each(|bn|{
+                let a = (a_ptr + am * a_ld) as *const f32;
+                let b = (b_ptr + bn * b_ld) as *const f32;
+                let c = (c_ptr + bn * c_ld + am) as *mut f32;
+
+                let a_slice = std::slice::from_raw_parts(a, k);
+                let b_slice = std::slice::from_raw_parts(b, k);
+                let sum = vec_dot_f32_f32_simd(a_slice, b_slice, k);
+                *c = alpha * sum + beta * *c;
+            });
+        });
     });
 }
 
@@ -284,7 +350,25 @@ impl crate::Operator for Operator {
         use ggml_quants::types as qty;
         match (dt_a, dt_b) {
             (ty::F16, ty::F16) => gemm!(f16; f16::from_f32(alpha), f16::from_f32(beta)),
-            (ty::F32, ty::F32) => gemm!(f32; alpha, beta),
+            // (ty::F32, ty::F32) => gemm!(f32; alpha, beta),
+            // (ty::F32, ty::F32) => kongzhuan(),
+            (ty::F32, ty::F32) => gemm_f32_f32(
+                a as *const f32,
+                b as *const f32,
+                c as *mut f32,
+                batch,
+                m,
+                n,
+                k,
+                a_ld as usize,
+                b_ld as usize,
+                c_ld as usize,
+                a_stride as isize,
+                b_stride as isize,
+                c_stride as isize,
+                alpha,
+                beta,
+            ),
             (ty::F64, ty::F64) => gemm!(f64; alpha as _, beta as _),
             (ty::F32, qty::Q8_0) => gemm_q8_q8(
                 a as *const Q8_0,
