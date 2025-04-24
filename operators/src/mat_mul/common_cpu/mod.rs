@@ -68,40 +68,40 @@ pub fn vec_dot_f32_f32(a: &[f32], a_offset: usize, b: &[f32], b_offset: usize, l
     sum
 }
 
-fn vec_dot_f32_f32_simd(
-    a: &[f32],
-    b: &[f32],
-    k: usize
+unsafe fn vec_dot_f32_f32_simd(
+    a_ptr: *const f32,
+    a_stride: usize,
+    b_ptr: *const f32,
+    b_stride: usize,
+    k: usize,
 ) -> f32 {
-    use std::arch::x86_64::*;
+    let mut sumv = _mm256_setzero_ps();
+    let k_rounded = k - k % 8;
 
-    unsafe {
+    for ki in (0..k_rounded).step_by(8) {
+        let mut a_chunk = [0.0f32; 8];
+        let mut b_chunk = [0.0f32; 8];
 
-        let mut sumv = _mm256_setzero_ps();
-        let k_rounded_down = k - k % 8; // Round down to the nearest multiple of 8
-
-        for ki in (0..k_rounded_down).step_by(8) {
-            let av = _mm256_loadu_ps(a.as_ptr().add(ki));
-            let bv = _mm256_loadu_ps(b.as_ptr().add(ki));
-            // Fused multiply-add operation: sumv += av * bv
-            sumv = _mm256_fmadd_ps(av, bv, sumv);
+        for i in 0..8 {
+            a_chunk[i] = *a_ptr.add((ki + i) * a_stride);
+            b_chunk[i] = *b_ptr.add((ki + i) * b_stride);
         }
 
-        // Horizontal sum of the vector elements
-        let mut sum_arr = [0.0_f32; 8];
-        _mm256_storeu_ps(sum_arr.as_mut_ptr(), sumv);
-        let partial_sum = sum_arr.iter().sum::<f32>();
-
-        // Scalar computation for the remaining elements
-        let mut scalar_sum = 0.0;
-        for ki in k_rounded_down..k {
-            scalar_sum += a[ki] * b[ki];
-        }
-
-        partial_sum + scalar_sum
+        let av = _mm256_loadu_ps(a_chunk.as_ptr());
+        let bv = _mm256_loadu_ps(b_chunk.as_ptr());
+        sumv = _mm256_fmadd_ps(av, bv, sumv);
     }
-}
 
+    let mut sum_arr = [0.0f32; 8];
+    _mm256_storeu_ps(sum_arr.as_mut_ptr(), sumv);
+    let mut total = sum_arr.iter().sum::<f32>();
+
+    for ki in k_rounded..k {
+        total += *a_ptr.add(ki * a_stride) * *b_ptr.add(ki * b_stride);
+    }
+
+    total
+}
 
 pub fn quantize_f32_q8_0(data: *const f32, ld: usize, rows: usize, columns: usize) -> Vec<Q8_0> {
     //TODO:实现对任意维度的量化
@@ -178,35 +178,27 @@ fn gemm_q8_q8(
         let a_ptr = a.offset(i * a_stride);
         let b_ptr = b.offset(i * b_stride);
         let b_vec = quantize_f32_q8_0(b_ptr as *const f32, b_ld as usize, k, n);
-        let c_ptr = c.offset(i * c_stride);
+        let c_ptr = c.offset(i * c_stride) as usize;
         let a_ref = slice::from_raw_parts(a_ptr, m * k / 32);
         let b_ref = b_vec.as_slice();
-        let c_ref = slice::from_raw_parts_mut(c_ptr, m * n);
-        let work_len = c_ref.len() / 16;
+        let thread_num = 16;
+        let work_len = m * n / thread_num;
         let chunk_len = 16;
-        let _ = crossbeam::scope(|s| {
-            c_ref
-                .chunks_mut(work_len)
-                .enumerate()
-                .for_each(|(work_idx, work_buf)| {
-                    s.spawn(move |_| {
-                        work_buf.chunks_mut(chunk_len).enumerate().for_each(
-                            |(chunk_idx, chunk_buf)| {
-                                for (i, cval) in chunk_buf.iter_mut().enumerate() {
-                                    let elem_idx = work_idx * work_len + chunk_idx * chunk_len + i;
-                                    let am = elem_idx % m;
-                                    let bn: usize = (elem_idx - am) / m;
-                                    let sum = vec_dot_q8_0_q8_0_avx2(
-                                        &a_ref[am * a_ld / 32 as usize
-                                            ..am * a_ld / 32 as usize + k / 32],
-                                        &b_ref[bn * k / 32 as usize..bn * k / 32 as usize + k / 32],
-                                    );
-                                    *cval = alpha * sum + beta * *cval;
-                                }
-                            },
-                        );
-                    });
+        let chunk_num = work_len / chunk_len;
+        (0..thread_num).into_par_iter().for_each(|tid| {
+            (0..chunk_num).into_par_iter().for_each(|cid| {
+                (0..chunk_len).into_par_iter().for_each(|i| {
+                    let elem_idx = tid * work_len + cid * chunk_len + i;
+                    let am = elem_idx % m;
+                    let bn = (elem_idx - am) / m;
+                    let sum = vec_dot_q8_0_q8_0_avx2(
+                        &a_ref[am * a_ld / 32 as usize..am * a_ld / 32 as usize + k / 32],
+                        &b_ref[bn * k / 32 as usize..bn * k / 32 as usize + k / 32],
+                    );
+                    let temp_c = (c_ptr as *mut f32).add(elem_idx);
+                    *temp_c = alpha * sum + beta * *temp_c;
                 });
+            });
         });
     });
 }
@@ -219,29 +211,29 @@ fn gemm_f32_f32(
     m: usize,
     n: usize,
     k: usize,
-    a_ld: usize,
-    b_ld: usize,
-    c_ld: usize,
+    lhs_cs: usize,
+    lhs_rs: usize,
+    rhs_cs: usize,
+    rhs_rs: usize,
+    dst_cs: usize,
+    dst_rs: usize,
     a_stride: isize,
     b_stride: isize,
     c_stride: isize,
     alpha: f32,
     beta: f32,
 ) {
-
     (0..batch as isize).for_each(|i| unsafe {
         let a_ptr = a.offset(i * a_stride) as usize;
         let b_ptr = b.offset(i * b_stride) as usize;
         let c_ptr = c.offset(i * c_stride) as usize;
         (0..m).into_par_iter().for_each(|am| {
-            (0..n).into_par_iter().for_each(|bn|{
-                let a = (a_ptr + am * a_ld) as *const f32;
-                let b = (b_ptr + bn * b_ld) as *const f32;
-                let c = (c_ptr + bn * c_ld + am) as *mut f32;
-
-                let a_slice = std::slice::from_raw_parts(a, k);
-                let b_slice = std::slice::from_raw_parts(b, k);
-                let sum = vec_dot_f32_f32_simd(a_slice, b_slice, k);
+            (0..n).into_par_iter().for_each(|bn| {
+                let a = (a_ptr + std::mem::size_of::<f32>() * (am * lhs_rs)) as *const f32;
+                let b = (b_ptr + std::mem::size_of::<f32>() * (bn * rhs_cs)) as *const f32;
+                let c =
+                    (c_ptr + std::mem::size_of::<f32>() * (bn * dst_cs + am * dst_rs)) as *mut f32;
+                let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, rhs_rs, k);
                 *c = alpha * sum + beta * *c;
             });
         });
@@ -337,7 +329,7 @@ impl crate::Operator for Operator {
                         false,
                         false,
                         false,
-                        gemm::Parallelism::Rayon(0),
+                        gemm::Parallelism::Rayon(64),
                     )
                 })
             };
@@ -360,9 +352,12 @@ impl crate::Operator for Operator {
                 m,
                 n,
                 k,
-                a_ld as usize,
-                b_ld as usize,
+                lhs_cs as usize,
+                lhs_rs as usize,
+                rhs_cs as usize,
+                rhs_rs as usize,
                 c_ld as usize,
+                1 as usize,
                 a_stride as isize,
                 b_stride as isize,
                 c_stride as isize,

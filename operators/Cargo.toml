@@ -23,7 +23,7 @@ half = "2.4"
 log = "0.4"
 ggml-quants = {git = "https://github.com/crapromer/gguf.git" , rev = "495fe62"}
 
-gemm = { version = "0.18", optional = true }
+gemm = { version = "0.18.2", optional = true ,features = ["rayon"]}
 
 clrt = { workspace = true, optional = true }
 
