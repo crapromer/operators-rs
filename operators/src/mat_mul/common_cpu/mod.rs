@@ -72,7 +72,6 @@ unsafe fn vec_dot_f32_f32_simd(
     a_ptr: *const f32,
     a_stride: usize,
     b_ptr: *const f32,
-    b_stride: usize,
     k: usize,
 ) -> f32 {
     let mut sumv = _mm256_setzero_ps();
@@ -80,15 +79,13 @@ unsafe fn vec_dot_f32_f32_simd(
 
     for ki in (0..k_rounded).step_by(8) {
         let mut a_chunk = [0.0f32; 8];
-        let mut b_chunk = [0.0f32; 8];
 
         for i in 0..8 {
             a_chunk[i] = *a_ptr.add((ki + i) * a_stride);
-            b_chunk[i] = *b_ptr.add((ki + i) * b_stride);
         }
 
         let av = _mm256_loadu_ps(a_chunk.as_ptr());
-        let bv = _mm256_loadu_ps(b_chunk.as_ptr());
+        let bv = _mm256_loadu_ps(b_ptr.add(ki));
         sumv = _mm256_fmadd_ps(av, bv, sumv);
     }
 
@@ -97,7 +94,7 @@ unsafe fn vec_dot_f32_f32_simd(
     let mut total = sum_arr.iter().sum::<f32>();
 
     for ki in k_rounded..k {
-        total += *a_ptr.add(ki * a_stride) * *b_ptr.add(ki * b_stride);
+        total += *a_ptr.add(ki * a_stride) * *b_ptr.add(ki);
     }
 
     total
@@ -181,7 +178,7 @@ fn gemm_q8_q8(
         let c_ptr = c.offset(i * c_stride) as usize;
         let a_ref = slice::from_raw_parts(a_ptr, m * k / 32);
         let b_ref = b_vec.as_slice();
-        let thread_num = 16;
+        let thread_num = 20;
         let work_len = m * n / thread_num;
         let chunk_len = 16;
         let chunk_num = work_len / chunk_len;
@@ -227,13 +224,32 @@ fn gemm_f32_f32(
         let a_ptr = a.offset(i * a_stride) as usize;
         let b_ptr = b.offset(i * b_stride) as usize;
         let c_ptr = c.offset(i * c_stride) as usize;
-        (0..m).into_par_iter().for_each(|am| {
-            (0..n).into_par_iter().for_each(|bn| {
+        // let thread_num = 20;
+        // let work_len = m * n / thread_num;
+        // let chunk_len = 32;
+        // let chunk_num = work_len / chunk_len;
+        // (0..thread_num).into_par_iter().for_each(|tid| {
+        //     (0..chunk_num).into_par_iter().for_each(|cid| {
+        //         (0..chunk_len).into_par_iter().for_each(|i| {
+        //             let elem_idx = tid * work_len + cid * chunk_len + i;
+        //             let am = elem_idx % m;
+        //             let bn = (elem_idx - am) / m;
+        //             let a = (a_ptr + std::mem::size_of::<f32>() * (am * lhs_rs)) as *const f32;
+        //             let b = (b_ptr + std::mem::size_of::<f32>() * (bn * rhs_cs)) as *const f32;
+        //             let c =
+        //                 (c_ptr + std::mem::size_of::<f32>() * (bn * dst_cs + am * dst_rs)) as *mut f32;
+        //             let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, rhs_rs, k);
+        //             *c = alpha * sum + beta * *c;
+        //         });
+        //     });
+        // });
+        (0..n).into_par_iter().for_each(|bn| {
+            (0..m).into_par_iter().for_each(|am| {
                 let a = (a_ptr + std::mem::size_of::<f32>() * (am * lhs_rs)) as *const f32;
                 let b = (b_ptr + std::mem::size_of::<f32>() * (bn * rhs_cs)) as *const f32;
                 let c =
                     (c_ptr + std::mem::size_of::<f32>() * (bn * dst_cs + am * dst_rs)) as *mut f32;
-                let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, rhs_rs, k);
+                let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, k);
                 *c = alpha * sum + beta * *c;
             });
         });
@@ -329,19 +345,39 @@ impl crate::Operator for Operator {
                         false,
                         false,
                         false,
-                        gemm::Parallelism::Rayon(64),
+                        gemm::Parallelism::Rayon(20),
                     )
                 })
             };
         }
         // let workspace_size = n * k / 32 * 34;
         // let mut workspace = Workspace::new(queue_alloc, workspace, workspace_size as _);
+        use std::time::Instant;
+        let start = Instant::now();
 
         use digit_layout::types as ty;
         use gemm::f16;
         use ggml_quants::types as qty;
         match (dt_a, dt_b) {
             (ty::F16, ty::F16) => gemm!(f16; f16::from_f32(alpha), f16::from_f32(beta)),
+            // (ty::F32, ty::F32) => unsafe {
+            //     matrixmultiply::sgemm(
+            //         m,
+            //         k,
+            //         n,
+            //         alpha,
+            //         a as *const f32,
+            //         lhs_rs,
+            //         lhs_cs,
+            //         b as *const f32,
+            //         rhs_rs,
+            //         rhs_cs,
+            //         beta,
+            //         c as *mut f32,
+            //         c_ld,
+            //         1,
+            //     )
+            // },
             // (ty::F32, ty::F32) => gemm!(f32; alpha, beta),
             // (ty::F32, ty::F32) => kongzhuan(),
             (ty::F32, ty::F32) => gemm_f32_f32(
@@ -385,6 +421,11 @@ impl crate::Operator for Operator {
             // (ty::F32, qty::Q8_0) => kongzhuan(),
             _ => Err(type_not_support(format!("Unsupported {dt_a},{dt_b}")))?,
         }
+        let duration = start.elapsed().as_micros();
+        // println!(
+        //     "{}*{} Mat a:(({},{}),({},{})),Mat b:(({},{}),({},{})), Mat c:(({},{}),({},{})) Duration:{:?}/{}",
+        //     dt_a.group_size(),dt_b.group_size(),m, k, lhs_rs, lhs_cs, k, n, rhs_rs, rhs_cs, m, n, 1, c_ld, duration,m*n*k/duration as usize
+        // );
         Ok(())
     }
 }
