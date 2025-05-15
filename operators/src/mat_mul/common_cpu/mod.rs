@@ -311,7 +311,8 @@ fn gemm_q8_q8(
 
 
         let thread_num = 32;
-        let chunk_size = 16;
+        let chunk_size = 32;
+        let block_size = 16;
         let m_chunk = (m + chunk_size -1)/chunk_size;
         let n_chunk = (n + chunk_size -1)/chunk_size;
         let m_chunk_elem = (m + m_chunk - 1) / m_chunk;
@@ -330,15 +331,32 @@ fn gemm_q8_q8(
                 let ir1_start = n_chunk_elem * ith1;
                 let ir0_end = cmp::min(ir0_start + m_chunk_elem, m);
                 let ir1_end = cmp::min(ir1_start + n_chunk_elem, n);
-                (ir0_start..ir0_end).for_each(|iir0|{
-                    (ir1_start..ir1_end).for_each(|iir1|{
-                        let a = (a_ptr + std::mem::size_of::<Q8_0>() * (iir0 * a_ld/32)) as *const Q8_0;
-                        let b = (b_quant + std::mem::size_of::<Q8_0>() * (iir1 * k/32)) as *const Q8_0;
-                        let c =
-                            (c_ptr + std::mem::size_of::<f32>() * (iir1 * c_ld  + iir0)) as *mut f32;
-                        let sum = vec_dot_q8_0_q8_0(a,b,k/32);
-                        // let sum = vec_dot_q8_0_q8_0_avx2(slice::from_raw_parts(a, k/32),slice::from_raw_parts(b, k/32));
-                        *c = alpha * sum + beta * *c;
+                // (ir0_start..ir0_end).for_each(|iir0|{
+                //     (ir1_start..ir1_end).for_each(|iir1|{
+                //         let a = (a_ptr + std::mem::size_of::<Q8_0>() * (iir0 * a_ld/32)) as *const Q8_0;
+                //         let b = (b_quant + std::mem::size_of::<Q8_0>() * (iir1 * k/32)) as *const Q8_0;
+                //         let c =
+                //             (c_ptr + std::mem::size_of::<f32>() * (iir1 * c_ld  + iir0)) as *mut f32;
+                //         let sum = vec_dot_q8_0_q8_0(a,b,k/32);
+                //         // let sum = vec_dot_q8_0_q8_0_avx2(slice::from_raw_parts(a, k/32),slice::from_raw_parts(b, k/32));
+                //         *c = alpha * sum + beta * *c;
+                //     });
+                // });
+
+                (ir1_start..ir1_end).step_by(block_size).for_each(|iir1|{
+                    (ir0_start..ir0_end).step_by(block_size).for_each(|iir0|{
+                        (iir1..cmp::min(iir1+block_size,n)).for_each(|bn|{
+                            (iir0..cmp::min(iir0+block_size,m)).for_each(|am|{
+                                let a = (a_ptr + std::mem::size_of::<Q8_0>() * (am * a_ld/32)) as *const Q8_0;
+                                let b = (b_quant + std::mem::size_of::<Q8_0>() * (bn * k/32)) as *const Q8_0;
+                                let c =
+                                    (c_ptr + std::mem::size_of::<f32>() * (bn * c_ld  + am)) as *mut f32;
+                                let sum = vec_dot_q8_0_q8_0(a,b,k/32);
+                                *c = alpha * sum + beta * *c;
+                            });
+                        });
+
+                        
                     });
                 });
                 chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
@@ -402,7 +420,8 @@ fn gemm_f32_f32(
         // });
 
         let thread_num = 32;
-        let chunk_size = 16;
+        let chunk_size = 32;
+        let block_size = 16;
         let m_chunk = (m + chunk_size -1)/chunk_size;
         let n_chunk = (n + chunk_size -1)/chunk_size;
         let m_chunk_elem = (m + m_chunk - 1) / m_chunk;
@@ -420,14 +439,20 @@ fn gemm_f32_f32(
                 let ir1_start = n_chunk_elem * ith1;
                 let ir0_end = cmp::min(ir0_start + m_chunk_elem, m);
                 let ir1_end = cmp::min(ir1_start + n_chunk_elem, n);
-                (ir0_start..ir0_end).for_each(|iir0|{
-                    (ir1_start..ir1_end).for_each(|iir1|{
-                        let a = (a_ptr + std::mem::size_of::<f32>() * (iir0 * lhs_rs)) as *const f32;
-                        let b = (b_ptr + std::mem::size_of::<f32>() * (iir1 * rhs_cs)) as *const f32;
-                        let c =
-                            (c_ptr + std::mem::size_of::<f32>() * (iir1 * dst_cs + iir0 * dst_rs)) as *mut f32;
-                        let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, k);
-                        *c = alpha * sum + beta * *c;
+                (ir0_start..ir0_end).step_by(block_size).for_each(|iir0|{
+                    (ir1_start..ir1_end).step_by(block_size).for_each(|iir1|{
+                        (iir0..cmp::min(iir0+block_size,m)).for_each(|am|{
+                            (iir1..cmp::min(iir1+block_size,n)).for_each(|bn|{
+                                let a = (a_ptr + std::mem::size_of::<f32>() * (am * lhs_rs)) as *const f32;
+                                let b = (b_ptr + std::mem::size_of::<f32>() * (bn * rhs_cs)) as *const f32;
+                                let c =
+                                    (c_ptr + std::mem::size_of::<f32>() * (bn * dst_cs + am * dst_rs)) as *mut f32;
+                                let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, k);
+                                *c = alpha * sum + beta * *c;
+                            });
+                        });
+
+                        
                     });
                 });
                 chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
