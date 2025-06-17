@@ -393,15 +393,15 @@ unsafe fn gemm_block(
     ir0_start: usize,
     ir0_end: usize,
     ir1_start: usize,
-    ir1_end: usize
+    ir1_end: usize,
 ) {
     // 累积块
-    let mut Cv: Vec<Vec<__m256>> = vec![vec![_mm256_setzero_ps(); chunk_size]; chunk_size];
+    let mut Cv: [[__m256; 8]; 8] = [[_mm256_setzero_ps(); 8]; 8];
 
-    let k_chunks = k/8;
+    let k_chunks = k / 8;
 
-    let rm = ir0_end-ir0_start;
-    let rn = ir1_end-ir1_start;
+    let rm = ir0_end - ir0_start;
+    let rn = ir1_end - ir1_start;
 
     for chunk in 0..k_chunks {
         let l = chunk * chunk_size;
@@ -411,13 +411,13 @@ unsafe fn gemm_block(
             let mut Av: Vec<__m256> = vec![_mm256_setzero_ps(); chunk_size];
             for i in ir0_start..ir0_end {
                 let a = a_ptr.add(i * lhs_rs + l);
-                Av[i-ir0_start] = _mm256_loadu_ps(a);
+                Av[i - ir0_start] = _mm256_loadu_ps(a);
             }
             for j in ir1_start..ir1_end {
-                let b = b_ptr.add(j* rhs_cs + l);
+                let b = b_ptr.add(j * rhs_cs + l);
                 let Bv = _mm256_loadu_ps(b);
                 for i in 0..rm {
-                    Cv[j-ir1_start][i] = _mm256_fmadd_ps(Av[i], Bv, Cv[j-ir1_start][i]);
+                    Cv[j - ir1_start][i] = _mm256_fmadd_ps(Av[i], Bv, Cv[j - ir1_start][i]);
                 }
             }
         } else {
@@ -425,13 +425,13 @@ unsafe fn gemm_block(
             let mut Bv: Vec<__m256> = vec![_mm256_setzero_ps(); chunk_size];
             for j in ir1_start..ir1_end {
                 let b = b_ptr.add(j * rhs_cs + l);
-                Bv[j-ir1_start] = _mm256_loadu_ps(b);
+                Bv[j - ir1_start] = _mm256_loadu_ps(b);
             }
             for i in ir0_start..ir0_end {
                 let a = a_ptr.add(i * lhs_rs + l);
                 let Av = _mm256_loadu_ps(a);
                 for j in 0..rn {
-                    Cv[j][i-ir0_start] = _mm256_fmadd_ps(Av, Bv[j], Cv[j][i-ir0_start]);
+                    Cv[j][i - ir0_start] = _mm256_fmadd_ps(Av, Bv[j], Cv[j][i - ir0_start]);
                 }
             }
         }
@@ -504,7 +504,7 @@ fn gemm_f32_f32(
                     ir0_start,
                     ir0_end,
                     ir1_start,
-                    ir1_end
+                    ir1_end,
                 );
                 chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
             }
