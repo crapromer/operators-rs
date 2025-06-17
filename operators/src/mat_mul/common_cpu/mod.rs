@@ -389,6 +389,8 @@ unsafe fn gemm_block(
     m: usize,
     n: usize,
     k: usize,
+    alpha: f32,
+    beta: f32,
     chunk_size: usize,
     ir0_start: usize,
     ir0_end: usize,
@@ -396,7 +398,7 @@ unsafe fn gemm_block(
     ir1_end: usize,
 ) {
     // 累积块
-    let mut Cv: [[__m256; 8]; 8] = [[_mm256_setzero_ps(); 8]; 8];
+    let mut Cv: [[__m256; 4]; 4] = [[_mm256_setzero_ps(); 4]; 4];
 
     let k_chunks = k / 8;
 
@@ -404,34 +406,34 @@ unsafe fn gemm_block(
     let rn = ir1_end - ir1_start;
 
     for chunk in 0..k_chunks {
-        let l = chunk * chunk_size;
+        let l = chunk * 8;
 
         if rm <= rn {
             // 行主循环：先加载 A 块
-            let mut Av: Vec<__m256> = vec![_mm256_setzero_ps(); chunk_size];
-            for i in ir0_start..ir0_end {
-                let a = a_ptr.add(i * lhs_rs + l);
-                Av[i - ir0_start] = _mm256_loadu_ps(a);
+            let mut Av: [__m256; 4] = [_mm256_setzero_ps(); 4];
+            for i in 0..rm {
+                let a = a_ptr.add((i + ir0_start) * lhs_rs + l);
+                Av[i] = _mm256_loadu_ps(a);
             }
-            for j in ir1_start..ir1_end {
-                let b = b_ptr.add(j * rhs_cs + l);
+            for j in 0..rn {
+                let b = b_ptr.add((j + ir1_start) * rhs_cs + l);
                 let Bv = _mm256_loadu_ps(b);
                 for i in 0..rm {
-                    Cv[j - ir1_start][i] = _mm256_fmadd_ps(Av[i], Bv, Cv[j - ir1_start][i]);
+                    Cv[j][i] = _mm256_fmadd_ps(Av[i], Bv, Cv[j][i]);
                 }
             }
         } else {
             // 列主循环：先加载 B 块
-            let mut Bv: Vec<__m256> = vec![_mm256_setzero_ps(); chunk_size];
-            for j in ir1_start..ir1_end {
-                let b = b_ptr.add(j * rhs_cs + l);
-                Bv[j - ir1_start] = _mm256_loadu_ps(b);
+            let mut Bv: [__m256; 4] = [_mm256_setzero_ps(); 4];
+            for j in 0..rn {
+                let b = b_ptr.add((j + ir1_start) * rhs_cs + l);
+                Bv[j] = _mm256_loadu_ps(b);
             }
-            for i in ir0_start..ir0_end {
-                let a = a_ptr.add(i * lhs_rs + l);
+            for i in 0..rm {
+                let a = a_ptr.add((i + ir0_start) * lhs_rs + l);
                 let Av = _mm256_loadu_ps(a);
                 for j in 0..rn {
-                    Cv[j][i - ir0_start] = _mm256_fmadd_ps(Av, Bv[j], Cv[j][i - ir0_start]);
+                    Cv[j][i] = _mm256_fmadd_ps(Av, Bv[j], Cv[j][i]);
                 }
             }
         }
@@ -440,8 +442,8 @@ unsafe fn gemm_block(
     // 累积写回
     for j in 0..rn {
         for i in 0..rm {
-            let c = c_ptr.add(j * dst_cs + i * dst_rs);
-            *c = hsum(Cv[j][i]);
+            let c = c_ptr.add((j + ir1_start) * dst_cs + (i + ir0_start) * dst_rs);
+            *c = alpha * hsum(Cv[j][i]) + beta * *c;
         }
     }
 }
@@ -472,7 +474,8 @@ fn gemm_f32_f32(
         let c_ptr = c.offset(i * c_stride) as usize;
 
         let thread_num = 32;
-        let chunk_size = 8;
+        let chunk_size = 4;
+        let block_size = 16;
         let m_chunk = (m + chunk_size - 1) / chunk_size;
         let n_chunk = (n + chunk_size - 1) / chunk_size;
         let m_chunk_elem = (m + m_chunk - 1) / m_chunk;
@@ -481,31 +484,54 @@ fn gemm_f32_f32(
 
         (0..thread_num).into_par_iter().for_each(|tid| {
             let mut chunk_id = tid;
-            if chunk_id < m_chunk * n_chunk {
+            while chunk_id < m_chunk * n_chunk {
                 let ith0 = chunk_id % m_chunk;
                 let ith1 = chunk_id / m_chunk;
                 let ir0_start = m_chunk_elem * ith0;
                 let ir1_start = n_chunk_elem * ith1;
                 let ir0_end = cmp::min(ir0_start + m_chunk_elem, m);
                 let ir1_end = cmp::min(ir1_start + n_chunk_elem, n);
-                gemm_block(
-                    a_ptr as *const f32,
-                    b_ptr as *const f32,
-                    c_ptr as *mut f32,
-                    lhs_rs,
-                    lhs_cs,
-                    rhs_cs,
-                    dst_rs,
-                    dst_cs,
-                    m,
-                    n,
-                    k,
-                    chunk_size,
-                    ir0_start,
-                    ir0_end,
-                    ir1_start,
-                    ir1_end,
-                );
+                if lhs_cs > 1 {
+                    (ir0_start..ir0_end).step_by(block_size).for_each(|iir0| {
+                        (ir1_start..ir1_end).step_by(block_size).for_each(|iir1| {
+                            (iir0..cmp::min(iir0 + block_size, m)).for_each(|am| {
+                                (iir1..cmp::min(iir1 + block_size, n)).for_each(|bn| {
+                                    let a = (a_ptr + std::mem::size_of::<f32>() * (am * lhs_rs))
+                                        as *const f32;
+                                    let b = (b_ptr + std::mem::size_of::<f32>() * (bn * rhs_cs))
+                                        as *const f32;
+                                    let c = (c_ptr
+                                        + std::mem::size_of::<f32>() * (bn * dst_cs + am * dst_rs))
+                                        as *mut f32;
+                                    let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, k);
+                                    *c = alpha * sum + beta * *c;
+                                });
+                            });
+                        });
+                    });
+                } else {
+                    gemm_block(
+                        a_ptr as *const f32,
+                        b_ptr as *const f32,
+                        c_ptr as *mut f32,
+                        lhs_rs,
+                        lhs_cs,
+                        rhs_cs,
+                        dst_rs,
+                        dst_cs,
+                        m,
+                        n,
+                        k,
+                        alpha,
+                        beta,
+                        chunk_size,
+                        ir0_start,
+                        ir0_end,
+                        ir1_start,
+                        ir1_end,
+                    );
+                }
+
                 chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
             }
         });
