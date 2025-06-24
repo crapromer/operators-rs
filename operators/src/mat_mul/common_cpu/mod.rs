@@ -3,6 +3,9 @@ use crate::{
     common_cpu::Cpu, type_not_support, ByteOf, LaunchError, QueueAlloc, SchemeError, Workspace,
 };
 mod archutil;
+mod qblasf32;
+mod qblasq8;
+use blasoxide::sgemm;
 use core::slice;
 use ggml_quants::Q8_0;
 use half::f16;
@@ -345,38 +348,52 @@ fn gemm_q8_q8(
         let current_chunk = AtomicUsize::new(0);
         // println!("{},{}===============",m_chunk,n_chunk);
         (0..thread_num).into_par_iter().for_each(|tid| {
-            let mut chunk_id = tid;
-            loop {
-                if chunk_id >= m_chunk * n_chunk {
-                    break;
-                }
-                let ith0 = chunk_id % m_chunk;
-                let ith1 = chunk_id / m_chunk;
-                let ir0_start = m_chunk_elem * ith0;
-                let ir1_start = n_chunk_elem * ith1;
-                let ir0_end = cmp::min(ir0_start + m_chunk_elem, m);
-                let ir1_end = cmp::min(ir1_start + n_chunk_elem, n);
-                (ir0_start..ir0_end).for_each(|iir0| {
-                    (ir1_start..ir1_end).for_each(|iir1| {
-                        let Cv: Vec<Vec<f32>> = vec![vec![0.0; chunk_size]; chunk_size];
-                        let a = (a_ptr + std::mem::size_of::<Q8_0>() * (iir0 * a_ld / 32))
-                            as *const Q8_0;
-                        let b = (b_quant + std::mem::size_of::<Q8_0>() * (iir1 * k / 32))
-                            as *const Q8_0;
-                        let c =
-                            (c_ptr + std::mem::size_of::<f32>() * (iir1 * c_ld + iir0)) as *mut f32;
-                        let sum = vec_dot_q8_0_q8_0(a, b, k / 32);
-                        // let sum = vec_dot_q8_0_q8_0_avx2(slice::from_raw_parts(a, k/32),slice::from_raw_parts(b, k/32));
-                        *c = alpha * sum + beta * *c;
-                    });
-                });
-                chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
+            // let mut chunk_id = tid;
+            // loop {
+            //     if chunk_id >= m_chunk * n_chunk {
+            //         break;
+            //     }
+            //     let ith0 = chunk_id % m_chunk;
+            //     let ith1 = chunk_id / m_chunk;
+            //     let ir0_start = m_chunk_elem * ith0;
+            //     let ir1_start = n_chunk_elem * ith1;
+            //     let ir0_end = cmp::min(ir0_start + m_chunk_elem, m);
+            //     let ir1_end = cmp::min(ir1_start + n_chunk_elem, n);
+            //     (ir0_start..ir0_end).for_each(|iir0| {
+            //         (ir1_start..ir1_end).for_each(|iir1| {
+            //             let Cv: Vec<Vec<f32>> = vec![vec![0.0; chunk_size]; chunk_size];
+            //             let a = (a_ptr + std::mem::size_of::<Q8_0>() * (iir0 * a_ld / 32))
+            //                 as *const Q8_0;
+            //             let b = (b_quant + std::mem::size_of::<Q8_0>() * (iir1 * k / 32))
+            //                 as *const Q8_0;
+            //             let c =
+            //                 (c_ptr + std::mem::size_of::<f32>() * (iir1 * c_ld + iir0)) as *mut f32;
+            //             let sum = vec_dot_q8_0_q8_0(a, b, k / 32);
+            //             // let sum = vec_dot_q8_0_q8_0_avx2(slice::from_raw_parts(a, k/32),slice::from_raw_parts(b, k/32));
+            //             *c = alpha * sum + beta * *c;
+            //         });
+            //     });
+            //     chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
+            // }
+            let mut blas = qblasq8::qblasq8::new(
+                k,
+                a_ptr as *const Q8_0,
+                a_ld,
+                b_quant as *const Q8_0,
+                k,
+                c_ptr as *mut f32,
+                c_ld,
+                tid,
+                thread_num,
+            );
+            unsafe {
+                blas.gemm(m, n);
             }
         });
     });
 }
 
-#[inline(always)]
+#[inline(never)]
 unsafe fn gemm_block(
     a_ptr: *const f32,
     b_ptr: *const f32,
@@ -448,6 +465,48 @@ unsafe fn gemm_block(
     }
 }
 
+#[inline(always)]
+unsafe fn gemm_block_line(
+    a_ptr: *const f32,
+    b_ptr: *const f32,
+    c_ptr: *mut f32,
+    lhs_rs: usize,
+    lhs_cs: usize,
+    rhs_cs: usize,
+    dst_rs: usize,
+    dst_cs: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f32,
+    beta: f32,
+    chunk_size: usize,
+    ir0_start: usize,
+    ir0_end: usize,
+    ir1_start: usize,
+    ir1_end: usize,
+) {
+    const arr_size: usize = 2;
+    let mut ax = [_mm256_setzero_ps(); arr_size];
+    let mut ay = [_mm256_setzero_ps(); arr_size];
+    for am in ir0_start..ir0_end {
+        for bn in ir1_start..ir1_end {
+            let mut sum = [_mm256_setzero_ps(); arr_size];
+            let c = c_ptr.add(bn * dst_cs + am * dst_rs);
+            for i in (0..k).step_by(16) {
+                for j in 0..arr_size {
+                    ax[j] = _mm256_loadu_ps(a_ptr.add(am * lhs_rs + i + 8 * j));
+                    ay[j] = _mm256_loadu_ps(b_ptr.add(bn * rhs_cs + i + 8 * j));
+                    sum[j] = _mm256_fmadd_ps(ax[j], ay[j], sum[j]);
+                }
+            }
+
+            sum[0] = _mm256_add_ps(sum[0], sum[1]);
+            *c = alpha * hsum(sum[0]) + beta * *c;
+        }
+    }
+}
+
 fn gemm_f32_f32(
     a: *const f32,
     b: *const f32,
@@ -483,56 +542,70 @@ fn gemm_f32_f32(
         let current_chunk = AtomicUsize::new(0);
 
         (0..thread_num).into_par_iter().for_each(|tid| {
-            let mut chunk_id = tid;
-            while chunk_id < m_chunk * n_chunk {
-                let ith0 = chunk_id % m_chunk;
-                let ith1 = chunk_id / m_chunk;
-                let ir0_start = m_chunk_elem * ith0;
-                let ir1_start = n_chunk_elem * ith1;
-                let ir0_end = cmp::min(ir0_start + m_chunk_elem, m);
-                let ir1_end = cmp::min(ir1_start + n_chunk_elem, n);
-                if lhs_cs > 1 {
-                    (ir0_start..ir0_end).step_by(block_size).for_each(|iir0| {
-                        (ir1_start..ir1_end).step_by(block_size).for_each(|iir1| {
-                            (iir0..cmp::min(iir0 + block_size, m)).for_each(|am| {
-                                (iir1..cmp::min(iir1 + block_size, n)).for_each(|bn| {
-                                    let a = (a_ptr + std::mem::size_of::<f32>() * (am * lhs_rs))
-                                        as *const f32;
-                                    let b = (b_ptr + std::mem::size_of::<f32>() * (bn * rhs_cs))
-                                        as *const f32;
-                                    let c = (c_ptr
-                                        + std::mem::size_of::<f32>() * (bn * dst_cs + am * dst_rs))
-                                        as *mut f32;
-                                    let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, k);
-                                    *c = alpha * sum + beta * *c;
-                                });
-                            });
-                        });
-                    });
-                } else {
-                    gemm_block(
-                        a_ptr as *const f32,
-                        b_ptr as *const f32,
-                        c_ptr as *mut f32,
-                        lhs_rs,
-                        lhs_cs,
-                        rhs_cs,
-                        dst_rs,
-                        dst_cs,
-                        m,
-                        n,
-                        k,
-                        alpha,
-                        beta,
-                        chunk_size,
-                        ir0_start,
-                        ir0_end,
-                        ir1_start,
-                        ir1_end,
-                    );
-                }
+            // let mut chunk_id = tid;
+            // while chunk_id < m_chunk * n_chunk {
+            //     let ith0 = chunk_id % m_chunk;
+            //     let ith1 = chunk_id / m_chunk;
+            //     let ir0_start = m_chunk_elem * ith0;
+            //     let ir1_start = n_chunk_elem * ith1;
+            //     let ir0_end = cmp::min(ir0_start + m_chunk_elem, m);
+            //     let ir1_end = cmp::min(ir1_start + n_chunk_elem, n);
+            //     if lhs_cs > 1 {
+            //         (ir0_start..ir0_end).step_by(block_size).for_each(|iir0| {
+            //             (ir1_start..ir1_end).step_by(block_size).for_each(|iir1| {
+            //                 (iir0..cmp::min(iir0 + block_size, m)).for_each(|am| {
+            //                     (iir1..cmp::min(iir1 + block_size, n)).for_each(|bn| {
+            //                         let a = (a_ptr + std::mem::size_of::<f32>() * (am * lhs_rs))
+            //                             as *const f32;
+            //                         let b = (b_ptr + std::mem::size_of::<f32>() * (bn * rhs_cs))
+            //                             as *const f32;
+            //                         let c = (c_ptr
+            //                             + std::mem::size_of::<f32>() * (bn * dst_cs + am * dst_rs))
+            //                             as *mut f32;
+            //                         let sum = vec_dot_f32_f32_simd(a, lhs_cs, b, k);
+            //                         *c = alpha * sum + beta * *c;
+            //                     });
+            //                 });
+            //             });
+            //         });
+            //     } else {
+            //         gemm_block_line(
+            //             a_ptr as *const f32,
+            //             b_ptr as *const f32,
+            //             c_ptr as *mut f32,
+            //             lhs_rs,
+            //             lhs_cs,
+            //             rhs_cs,
+            //             dst_rs,
+            //             dst_cs,
+            //             m,
+            //             n,
+            //             k,
+            //             alpha,
+            //             beta,
+            //             chunk_size,
+            //             ir0_start,
+            //             ir0_end,
+            //             ir1_start,
+            //             ir1_end,
+            //         );
+            //     }
 
-                chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
+            //     chunk_id = current_chunk.fetch_add(1, Ordering::Relaxed);
+            // }
+            let mut blas = qblasf32::qblasf32::new(
+                k,
+                a_ptr as *const f32,
+                lhs_rs,
+                b_ptr as *const f32,
+                rhs_cs,
+                c_ptr as *mut f32,
+                dst_cs,
+                tid,
+                thread_num,
+            );
+            unsafe {
+                blas.gemm(m, n);
             }
         });
     });
@@ -703,10 +776,10 @@ impl crate::Operator for Operator {
             // (ty::F32, qty::Q8_0) => kongzhuan(),
             _ => Err(type_not_support(format!("Unsupported {dt_a},{dt_b}")))?,
         }
-        let duration = start.elapsed().as_micros();
+        // let duration = start.elapsed().as_micros();
         // println!(
-        //     "{}*{} Mat a:(({},{}),({},{})),Mat b:(({},{}),({},{})), Mat c:(({},{}),({},{})) Duration:{:?}/{}",
-        //     dt_a.group_size(),dt_b.group_size(),m, k, lhs_rs, lhs_cs, k, n, rhs_rs, rhs_cs, m, n, 1, c_ld, duration,m*n*k/duration as usize
+        //     "{}*{} Mat a:(({},{}),({},{})),Mat b:(({},{}),({},{})), Mat c:(({},{}),({},{})) Duration:{:?}",
+        //     dt_a.group_size(),dt_b.group_size(),m, k, lhs_rs, lhs_cs, k, n, rhs_rs, rhs_cs, m, n, 1, c_ld, duration as usize
         // );
         Ok(())
     }

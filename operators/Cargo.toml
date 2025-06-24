@@ -37,6 +37,7 @@ nccl = { workspace = true, optional = true }
 fslock = { version = "0.2", optional = true }
 libloading = { version = "0.8", optional = true }
 crossbeam = "0.8.4"
+blasoxide = "0.3.2"
 
 [build-dependencies]
 build-script-cfg = "0.0"
